@@ -3,7 +3,7 @@ sys.path.insert(0, "../Sknet/")
 
 import sknet
 from sknet.optimizers import Adam
-from sknet.losses import accuracy,crossentropy_logits
+from sknet.losses import StreamingAccuracy,crossentropy_logits
 from sknet.schedules import PiecewiseConstant
 
 import os
@@ -27,7 +27,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--proportion', type=float, default=0)
 parser.add_argument('--dataset', type=str, default='cifar10')
 parser.add_argument('--model', type=str, default='cnn',
-                            choices=['cnn','resnetsmall','resnetlarge'])
+                            choices=['cnn','resnetsmall','resnetlarge',
+                                    'mlpsmall','mlplarge'])
 args = parser.parse_args()
 
 PROPORTION = args.proportion
@@ -90,8 +91,33 @@ dnn.append(ops.Concat([dnn[-1],dnn[-1]+noise],axis=0))
 
 if MODEL=='cnn':
     sknet.networks.ConvLarge(dnn, dataset.n_classes)
-else:
+elif 'resnet' in MODEL:
     sknet.networks.Resnet(dnn, dataset.n_classes, D=D, W=W)
+elif MODEL=='mlpsmall':
+    dnn.append(ops.Dense(dnn[-1],2048,b=None))
+    dnn.append(ops.BatchNorm(dnn[-1],0))
+    dnn.append(ops.Activation(dnn[-1],0.01))
+    dnn.append(ops.Dense(dnn[-1],256,b=None))
+    dnn.append(ops.BatchNorm(dnn[-1],0))
+    dnn.append(ops.Activation(dnn[-1],0.01))
+    dnn.append(ops.Dense(dnn[-1],dataset.n_classes,b=None))
+elif MODEL=='mlplarge':
+    dnn.append(ops.Dense(dnn[-1],2048,b=None))
+    dnn.append(ops.BatchNorm(dnn[-1],0))
+    dnn.append(ops.Activation(dnn[-1],0.01))
+    dnn.append(ops.Dense(dnn[-1],2048,b=None))
+    dnn.append(ops.BatchNorm(dnn[-1],0))
+    dnn.append(ops.Activation(dnn[-1],0.01))
+    dnn.append(ops.Dense(dnn[-1],2048,b=None))
+    dnn.append(ops.BatchNorm(dnn[-1],0))
+    dnn.append(ops.Activation(dnn[-1],0.01))
+    dnn.append(ops.Dense(dnn[-1],1024,b=None))
+    dnn.append(ops.BatchNorm(dnn[-1],0))
+    dnn.append(ops.Activation(dnn[-1],0.01))
+    dnn.append(ops.Dense(dnn[-1],256,b=None))
+    dnn.append(ops.BatchNorm(dnn[-1],0))
+    dnn.append(ops.Activation(dnn[-1],0.01))
+    dnn.append(ops.Dense(dnn[-1],dataset.n_classes,b=None))
 
 
 # Quantities
@@ -106,11 +132,11 @@ A_rows = tf.map_fn(compute_row, tf.range(dataset.n_classes), dtype=tf.float32)
 prediction = dnn[-1]
 loss = crossentropy_logits(p=dataset.labels,q=prediction[:32])
 hessian = tf.transpose(A_rows) #(32,n_classes)
-accu = accuracy(dataset.labels,prediction[:32])
+accu = StreamingAccuracy(dataset.labels,prediction[:32])
 
 B = dataset.N_BATCH('train_set')
 lr = PiecewiseConstant(0.005, {100*B:0.0015,150*B:0.001})
-optimizer = Adam(loss,lr,params=dnn.variables(trainable=True))
+optimizer = Adam(loss,dnn.variables(trainable=True),lr)
 minimizer = tf.group(optimizer.updates+dnn.updates)
 
 
@@ -120,15 +146,14 @@ minimizer = tf.group(optimizer.updates+dnn.updates)
 minimize = sknet.Worker(name='loss',context='train_set', op=[minimizer,loss,
             hessian, dataset.labels,dataset.true_labels, accu],
             deterministic=False,period=[1,100,100,100,100,1],
-            verbose=[0,2,0,0,0,1],
-            transform_function=[None, None, None, None, None, np.mean])
+            verbose=[0,2,0,0,0,1])
 
 accuv = sknet.Worker(name='accu',context='valid_set', op=[accu],
-            deterministic=True, transform_function=[np.mean], verbose=1)
+            deterministic=True, verbose=1)
 
 accut = sknet.Worker(name='accu',context='test_set',
             op=[accu, hessian, dataset.labels], deterministic=True,
-            transform_function=[np.mean,None,None], verbose=[1,0,0])
+            verbose=[1,0,0])
 
 queue = sknet.Queue((minimize, accuv, accut), filename=SAVE_PATH+'/HESSIAN/'\
                       +'random_{}_{}_{}.h5'.format(DATASET, MODEL, PROPORTION))

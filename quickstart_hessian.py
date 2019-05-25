@@ -3,7 +3,7 @@ sys.path.insert(0, "../Sknet/")
 
 import sknet
 from sknet.optimizers import Adam
-from sknet.losses import accuracy,crossentropy_logits
+from sknet.losses import StreamingAccuracy,crossentropy_logits
 from sknet.schedules import PiecewiseConstant
 
 import os
@@ -28,16 +28,18 @@ parser.add_argument('--data_augmentation', type=int, default=0,choices=[0,1])
 parser.add_argument('--dataset', type=str, default='cifar10')
 parser.add_argument('--model', type=str, default='cnn',
                             choices=['cnn','resnetsmall','resnetlarge'])
+parser.add_argument('--regularization', type=float)
 args = parser.parse_args()
 
 DATA_AUGMENTATION = args.data_augmentation
+REGULARIZATION = args.regularization
 DATASET = args.dataset
 MODEL = args.model
 if MODEL=='resnetsmall':
     D = 1
     W = 1
 elif MODEL=='resnetlarge':
-    D = 4
+    D = 2
     W = 1
 
 
@@ -53,20 +55,19 @@ elif DATASET=='svhn':
 elif DATASET=='cifar100':
     dataset = sknet.dataset.load_cifar100()
 
-if "test_set" not in dataset.sets:
-    dataset.split_set("train_set","test_set",0.25)
 if "valid_set" not in dataset.sets:
     dataset.split_set("train_set","valid_set",0.15)
 
 preprocess = sknet.dataset.Standardize().fit(dataset['images/train_set'])
 dataset['images/train_set'] = preprocess.transform(dataset['images/train_set'])
-dataset['images/test_set']  = preprocess.transform(dataset['images/test_set'])
+dataset['images/test_set'] = preprocess.transform(dataset['images/test_set'])
 dataset['images/valid_set'] = preprocess.transform(dataset['images/valid_set'])
 
-dataset.create_placeholders(batch_size=32,
-        iterators_dict={'train_set':BatchIterator("random_see_all"),
-                       'valid_set':BatchIterator('continuous'),
-                       'test_set':BatchIterator('continuous')},device="/cpu:0")
+iterator = BatchIterator(16, {'train_set': "random_see_all",
+                         'valid_set': 'continuous',
+                         'test_set': 'continuous'})
+
+dataset.create_placeholders(iterator, device="/cpu:0")
 
 # Create Network
 #---------------
@@ -83,7 +84,7 @@ else:
     dnn.append(dataset.images)
     start = 1
 
-noise = tf.random_normal(dnn[-1].get_shape().as_list())*0.00001
+noise = tf.random_normal(dnn[-1].get_shape().as_list())*0.0001
 
 dnn.append(ops.Concat([dnn[-1],dnn[-1]+noise],axis=0))
 
@@ -97,19 +98,28 @@ else:
 #-----------
 
 def compute_row(i):
-    selected_row = tf.ones((64,1))*tf.one_hot(i,dataset.n_classes)
+    selected_row = tf.ones((32,1))*tf.one_hot(i,dataset.n_classes)
     grad = tf.gradients(dnn[-1], dnn[start], selected_row)[0]
-    return tf.sqrt(tf.reduce_sum(tf.square(grad[:32]-grad[32:]), [1,2,3]))
+    return tf.reduce_mean(tf.sqrt(tf.reduce_sum(tf.square(grad[:16]-grad[16:]),
+                          [1,2,3])))
 
-A_rows = tf.map_fn(compute_row, tf.range(dataset.n_classes), dtype=tf.float32)
 prediction = dnn[-1]
-loss = crossentropy_logits(p=dataset.labels,q=prediction[:32])
-hessian = tf.transpose(A_rows) #(32,n_classes)
-accu = accuracy(dataset.labels,prediction[:32])
+loss = sknet.losses.crossentropy_logits(p=dataset.labels,q=prediction[:16])
+hessian = tf.reduce_sum(tf.map_fn(compute_row, tf.range(dataset.n_classes),
+                         dtype=tf.float32))
+accu = StreamingAccuracy(dataset.labels,prediction[:16])
 
-B = dataset.N_BATCH('train_set')
+
+B = dataset.N('train_set')//16
 lr = PiecewiseConstant(0.005, {100*B:0.0015,150*B:0.001})
-optimizer = Adam(loss,lr,params=dnn.variables(trainable=True))
+
+if REGULARIZATION:
+    loss_extra = REGULARIZATION*hessian
+    optimizer = sknet.optimizers.Adam(loss+loss_extra,
+                                      dnn.variables(trainable=True), lr)
+else:
+    optimizer = sknet.optimizers.Adam(loss, dnn.variables(trainable=True), lr)
+
 minimizer = tf.group(optimizer.updates+dnn.updates)
 
 
@@ -117,18 +127,19 @@ minimizer = tf.group(optimizer.updates+dnn.updates)
 #---------
 
 minimize = sknet.Worker(name='loss',context='train_set',
-            op=[minimizer,loss, hessian, dataset.labels],
-            deterministic=False,period=[1,100,100,100], verbose=[0,2,0,0])
+            op=[minimizer,loss, hessian],
+            deterministic=False,period=[1,100,100], verbose=[0,2,2])
 
 accuv = sknet.Worker(name='accu',context='valid_set', op=[accu],
-            deterministic=True, transform_function=[np.mean], verbose=1)
+            deterministic=True, verbose=1)
 
 accut = sknet.Worker(name='accu',context='test_set',
-            op=[accu, hessian, dataset.labels], deterministic=True,
-            transform_function=[np.mean,None,None], verbose=[1,0,0])
+            op=[accu, hessian], deterministic=True,
+            verbose=[1,0])
 
 queue = sknet.Queue((minimize, accuv, accut), filename=SAVE_PATH+'/HESSIAN/'\
-                +'hessian_{}_{}_{}.h5'.format(DATASET,MODEL,DATA_AUGMENTATION))
+                +'hessian_{}_{}_{}_{}.h5'.format(DATASET,MODEL,
+                DATA_AUGMENTATION,REGULARIZATION))
 
 # Pipeline
 #---------
