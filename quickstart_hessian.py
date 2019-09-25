@@ -127,8 +127,8 @@ minimizer = tf.group(optimizer.updates+dnn.updates)
 #---------
 
 minimize = sknet.Worker(name='loss',context='train_set',
-            op=[minimizer,loss, hessian],
-            deterministic=False,period=[1,100,100], verbose=[0,2,2])
+            op=[minimizer,loss, hessian, accu],
+            deterministic=False,period=[1,100,100,1], verbose=[0,2,2,0])
 
 accuv = sknet.Worker(name='accu',context='valid_set', op=[accu],
             deterministic=True, verbose=1)
